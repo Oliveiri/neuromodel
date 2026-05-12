@@ -1,0 +1,5 @@
+﻿torch
+torchvision
+numpy
+pillow
+bentoml>=1.3.0

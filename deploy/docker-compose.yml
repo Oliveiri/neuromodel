@@ -1,0 +1,237 @@
+version: "3.9"
+
+# ====================================================================
+# Neuro Demo - 肾癌病理 AI 诊断系统
+# 部署路径: /opt/docker/neuro-demo/docker-compose.yml
+#
+# 网络:
+#   shared_net  - 全局共享，NPM 反代入口（外部已创建）
+#   neuro_internal - 业务内部网络，模型/DB/缓存
+#
+# 对外端口: 无（全部通过 NPM 反代）
+# ====================================================================
+
+services:
+
+  # ================================================================
+  # Spring Boot API 网关（同时挂载 shared_net + neuro_internal）
+  # ================================================================
+  spring:
+    build:
+      context: ../spring-backend
+      dockerfile: Dockerfile
+    container_name: neuro-spring
+    restart: unless-stopped
+    networks:
+      - shared_net
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-neurochat123}
+    volumes:
+      - /data/wsi:/data/wsi:ro
+      - /data/tiles:/data/tiles:ro
+      - /data/artifacts:/data/artifacts
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ================================================================
+  # M1 - 肿瘤四分类 (ResNet18 + BentoML)
+  # ================================================================
+  m1-tumor-cls:
+    build:
+      context: ../m1-tumor-cls
+      dockerfile: Dockerfile
+    container_name: model-m1
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
+  # M2-ccRCC - 透明细胞癌分割 (UNet + BentoML)
+  # ================================================================
+  m2-ccrcc:
+    build:
+      context: ../m2-ccrcc
+      dockerfile: Dockerfile
+    container_name: model-m2-ccrcc
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
+  # M2-pRCC - 乳头状细胞癌分割 (UNet + BentoML)
+  # ================================================================
+  m2-prcc:
+    build:
+      context: ../m2-prcc
+      dockerfile: Dockerfile
+    container_name: model-m2-prcc
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
+  # M3 - 细胞核分割 (FastAPI + turing_segment)
+  # ================================================================
+  m3-nuclei:
+    build:
+      context: ../m3-nuclei
+      dockerfile: Dockerfile
+      args:
+        TURING_SEGMENT_PKG: ${TURING_SEGMENT_PKG:-turing_segment}
+        TURING_SEGMENT_PIP_INDEX_URL: ${TURING_SEGMENT_PIP_INDEX_URL:-}
+        TURING_SEGMENT_PIP_EXTRA_INDEX_URL: ${TURING_SEGMENT_PIP_EXTRA_INDEX_URL:-}
+    container_name: model-m3
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+      M3_MAX_BATCH_SIZE: ${M3_MAX_BATCH_SIZE:-64}
+      M3_MAX_INFLIGHT_PER_REQUEST: ${M3_MAX_INFLIGHT_PER_REQUEST:-8}
+      M3_GLOBAL_MAX_INFLIGHT: ${M3_GLOBAL_MAX_INFLIGHT:-32}
+      M3_SEGMENT_TIMEOUT_SEC: ${M3_SEGMENT_TIMEOUT_SEC:-120}
+      M3_MODEL_TYPE: ${M3_MODEL_TYPE:-he2}
+      M3_CHANNELS: ${M3_CHANNELS:-0,1,2}
+      M3_IMAGE_TYPE: ${M3_IMAGE_TYPE:-cv2}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
+  # M4 - 虚拟染色 (CycleGAN + FastAPI)
+  # ================================================================
+  m4-vstain:
+    build:
+      context: ../m4-vstain
+      dockerfile: Dockerfile
+    container_name: model-m4
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+      M4_CHECKPOINT_DIR: /app/checkpoints
+      M4_MAX_BATCH_SIZE: ${M4_MAX_BATCH_SIZE:-64}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
+  # MySQL
+  # ================================================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-neurochat123}
+      MYSQL_DATABASE: neurochat
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-neurochat123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ================================================================
+  # Qdrant 向量数据库
+  # ================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # ================================================================
+  # Embedding 服务 (bge-small-zh-v1.5)
+  # ================================================================
+  embedding:
+    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    container_name: embedding
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      MODEL_ID: BAAI/bge-small-zh-v1.5
+    volumes:
+      - embedding_data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+# ====================================================================
+# 网络
+# ====================================================================
+networks:
+  shared_net:
+    external: true
+    name: shared_net
+  neuro_internal:
+    driver: bridge
+    name: neuro_internal
+
+# ====================================================================
+# 持久化卷
+# ====================================================================
+volumes:
+  mysql_data:
+  qdrant_data:
+  embedding_data:

@@ -1,0 +1,43 @@
+﻿version: "3.9"
+
+services:
+  m3-seg:
+    container_name: ${M3_CONTAINER_NAME:-m3-seg}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TURING_SEGMENT_PKG: ${TURING_SEGMENT_PKG:-turing_segment}
+        TURING_SEGMENT_PIP_INDEX_URL: ${TURING_SEGMENT_PIP_INDEX_URL:-}
+        TURING_SEGMENT_PIP_EXTRA_INDEX_URL: ${TURING_SEGMENT_PIP_EXTRA_INDEX_URL:-}
+    image: ${M3_IMAGE_NAME:-m3-seg}:${M3_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${M3_PORT:-5004}:5004"
+    environment:
+      M3_MAX_BATCH_SIZE: ${M3_MAX_BATCH_SIZE:-64}
+      M3_MAX_INFLIGHT_PER_REQUEST: ${M3_MAX_INFLIGHT_PER_REQUEST:-8}
+      M3_GLOBAL_MAX_INFLIGHT: ${M3_GLOBAL_MAX_INFLIGHT:-32}
+      M3_SEGMENT_TIMEOUT_SEC: ${M3_SEGMENT_TIMEOUT_SEC:-120}
+      M3_MODEL_TYPE: ${M3_MODEL_TYPE:-he2}
+      M3_CHANNELS: ${M3_CHANNELS:-0,1,2}
+      M3_IMAGE_TYPE: ${M3_IMAGE_TYPE:-cv2}
+      TZ: ${TZ:-Asia/Shanghai}
+    networks:
+      m3-net:
+        ipv4_address: ${M3_IPV4_ADDRESS:-172.29.0.10}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5004/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  m3-net:
+    name: ${M3_DOCKER_NETWORK_NAME:-m3_infer_net}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${M3_DOCKER_SUBNET:-172.29.0.0/24}
+          gateway: ${M3_DOCKER_GATEWAY:-172.29.0.1}

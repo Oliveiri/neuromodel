@@ -1,0 +1,21 @@
+﻿# Ignore local envs and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Git and IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Temp and test artifacts
+tmp/
+temp/
+*.tmp
+
+# Docs and local notes not needed in image
+README_windows.md

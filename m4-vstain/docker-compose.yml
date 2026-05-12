@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  m4-vstain:
+    container_name: ${M4_CONTAINER_NAME:-m4-vstain}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${M4_IMAGE_NAME:-m4-vstain}:${M4_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${M4_PORT:-5005}:5005"
+    environment:
+      M4_CHECKPOINT_DIR: ${M4_CHECKPOINT_DIR:-/app/checkpoints}
+      M4_MAX_BATCH_SIZE: ${M4_MAX_BATCH_SIZE:-64}
+      TZ: ${TZ:-Asia/Shanghai}
+    networks:
+      m4-net:
+        ipv4_address: ${M4_IPV4_ADDRESS:-172.29.1.10}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5005/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  m4-net:
+    name: ${M4_DOCKER_NETWORK_NAME:-m4_infer_net}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${M4_DOCKER_SUBNET:-172.29.1.0/24}
+          gateway: ${M4_DOCKER_GATEWAY:-172.29.1.1}
