@@ -197,18 +197,19 @@ services:
       - qdrant_data:/qdrant/storage
 
   # ================================================================
-  # Embedding 服务 (bge-small-zh-v1.5)
+  # Embedding 服务 — 自建 bge-small-zh-v1.5（sentence-transformers）
   # ================================================================
   embedding:
-    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    build:
+      context: ../embedding
+      dockerfile: Dockerfile
     container_name: embedding
     restart: unless-stopped
     networks:
       - neuro_internal
     environment:
-      MODEL_ID: BAAI/bge-small-zh-v1.5
-    volumes:
-      - embedding_data:/data
+      TZ: Asia/Shanghai
+      EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
     deploy:
       resources:
         reservations:
@@ -234,4 +235,3 @@ networks:
 volumes:
   mysql_data:
   qdrant_data:
-  embedding_data:
