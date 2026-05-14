@@ -16,6 +16,19 @@ CREATE TABLE IF NOT EXISTS `user` (
     UNIQUE INDEX idx_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 1.1 认证会话表
+CREATE TABLE IF NOT EXISTS auth_session (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    token VARCHAR(512) NOT NULL,
+    expire_at DATETIME NOT NULL,
+    status INT DEFAULT 1,
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_token (token),
+    INDEX idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 2. WSI 切片表
 CREATE TABLE IF NOT EXISTS wsi_slide (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

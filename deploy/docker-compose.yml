@@ -30,8 +30,8 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-neurochat123}
     volumes:
-      - /data/wsi:/data/wsi:ro
-      - /data/tiles:/data/tiles:ro
+      - /data/wsi:/data/wsi
+      - /data/tiles:/data/tiles
       - /data/artifacts:/data/artifacts
     depends_on:
       mysql:

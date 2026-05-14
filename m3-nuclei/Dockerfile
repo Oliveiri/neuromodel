@@ -4,7 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     tini \
@@ -25,8 +27,8 @@ ARG TURING_SEGMENT_PKG=turing_segment
 ARG TURING_SEGMENT_PIP_INDEX_URL=
 ARG TURING_SEGMENT_PIP_EXTRA_INDEX_URL=
 
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt && \
+RUN python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple && \
     install_cmd="pip install -U \"$TURING_SEGMENT_PKG\"" && \
     if [ -n "$TURING_SEGMENT_PIP_INDEX_URL" ]; then \
       install_cmd="$install_cmd -i \"$TURING_SEGMENT_PIP_INDEX_URL\""; \

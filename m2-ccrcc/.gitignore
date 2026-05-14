@@ -6,5 +6,8 @@ venv/
 *.swp
 *.swo
 .vscode/
-images/
 .env
+outputs/*
+!outputs/save_weights/
+save_weights/*
+!save_weights/best_model.pth

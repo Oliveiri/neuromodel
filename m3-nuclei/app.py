@@ -14,7 +14,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from PIL import Image
 
 from schemas import BatchManifest, SampleMeta
-from core_infer import run_turing_segment, read_polygons, save_upload_file
+from core_infer import run_turing_segment, run_turing_segment_batch, read_polygons, save_upload_file
 from core_geometry import geometries_to_nuclei
 from core_stats import compute_q_stats
 
@@ -63,28 +63,79 @@ async def predict_batch(request: Request, manifest: str = Form(...)) -> dict[str
 
     request_id = manifest_obj.requestId or f"req-{int(time.time() * 1000)}"
 
-    async def run_one(sample: SampleMeta) -> dict[str, Any]:
-        async with _global_sem:
-            return await _process_one_sample(request_id, sample, file_map[sample.imageRef])
+    # 批量推理优化：所有图片写入共享临时目录，一次 turing_segment --image-dir 处理全批
+    # 模型仅加载一次（~30s），避免逐张子进程每张 35s 的开销
+    batch_dir = Path(tempfile.mkdtemp(prefix=f"m3_batch_{request_id}_"))
+    output_dir = Path(tempfile.mkdtemp(prefix=f"m3_out_{request_id}_"))
+    saved: dict[str, Path] = {}  # tileId → 图片路径
 
-    # 分组限并发执行，保证高并发稳定
-    results: list[dict[str, Any]] = []
-    tasks = [run_one(s) for s in manifest_obj.samples]
-    # 按输入顺序返回，保证一一对应
-    for i in range(0, len(tasks), MAX_INFLIGHT_PER_REQUEST):
-        chunk = tasks[i:i + MAX_INFLIGHT_PER_REQUEST]
-        chunk_results = await asyncio.gather(*chunk, return_exceptions=False)
-        results.extend(chunk_results)
+    try:
+        for s in manifest_obj.samples:
+            content = await file_map[s.imageRef].read()
+            suffix = Path(file_map[s.imageRef].filename or "input.png").suffix or ".png"
+            img_path = batch_dir / (s.tileId + suffix)
+            img_path.write_bytes(content)
+            saved[s.tileId] = img_path
 
-    success_count = sum(1 for r in results if "error" not in r)
-    failed_count = len(results) - success_count
+        # 一次 CLI 调用处理全批量文件夹
+        parquet_map = await asyncio.get_running_loop().run_in_executor(
+            _pool,
+            lambda: run_turing_segment_batch(batch_dir, output_dir,
+                                             timeout_sec=SEGMENT_TIMEOUT_SEC),
+        )
 
-    return {
-        "requestId": request_id,
-        "successCount": success_count,
-        "failedCount": failed_count,
-        "results": results,
-    }
+        # 逐样本组装结果
+        results: list[dict[str, Any]] = []
+        for s in manifest_obj.samples:
+            t0 = time.perf_counter()
+            base_payload = {
+                "tileId": s.tileId, "imageRef": s.imageRef,
+                "mpp": s.mpp, "level": s.level,
+                "x": s.x, "y": s.y, "width": s.width, "height": s.height,
+            }
+            try:
+                img_path = saved[s.tileId]
+                pq = parquet_map.get(s.tileId)
+                if pq is None:
+                    raise FileNotFoundError(f"no parquet output for tileId={s.tileId}")
+
+                geoms = await asyncio.get_running_loop().run_in_executor(
+                    _pool, lambda: read_polygons(pq))
+                nuclei = geometries_to_nuclei(geoms)
+
+                with Image.open(img_path) as im:
+                    w, h = im.size
+                stats_q1, stats_q2, stats_q3 = compute_q_stats(nuclei, w, h, s.mpp)
+                for n in nuclei:
+                    n.pop("_geom", None)
+
+                results.append({
+                    **base_payload,
+                    "nucleiPolygons": nuclei,
+                    "statsQ1": stats_q1, "statsQ2": stats_q2, "statsQ3": stats_q3,
+                    "meta": {
+                        "nucleusCount": len(nuclei),
+                        "imageWidth": w, "imageHeight": h,
+                        "latencyMs": round((time.perf_counter() - t0) * 1000, 2),
+                    },
+                })
+            except Exception as ex:
+                results.append({
+                    **base_payload,
+                    "error": str(ex),
+                    "meta": {"latencyMs": round((time.perf_counter() - t0) * 1000, 2)},
+                })
+
+        success_count = sum(1 for r in results if "error" not in r)
+        return {
+            "requestId": request_id,
+            "successCount": success_count,
+            "failedCount": len(results) - success_count,
+            "results": results,
+        }
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 async def _process_one_sample(request_id: str, sample: SampleMeta, upload_file) -> dict[str, Any]:
