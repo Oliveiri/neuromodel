@@ -162,6 +162,33 @@ services:
               capabilities: [gpu]
 
   # ================================================================
+  # Qwen2.5-VL 多模态大模型（独立项目 pathology_inference）
+  # ================================================================
+  qwen-vl:
+    build:
+      context: ../pathology_inference
+      dockerfile: Dockerfile
+    container_name: qwen-vl
+    restart: unless-stopped
+    networks:
+      - neuro_internal
+    environment:
+      TZ: Asia/Shanghai
+      MODEL_PATH: /data/models
+      BASE_TILE_PATH: /data/tiles
+      CUDA_VISIBLE_DEVICES: "1"
+    volumes:
+      - /data/models:/data/models:ro
+      - /data/tiles:/data/tiles:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ================================================================
   # MySQL
   # ================================================================
   mysql:
