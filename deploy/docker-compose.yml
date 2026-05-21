@@ -18,7 +18,7 @@ services:
   # ================================================================
   spring:
     build:
-      context: ../spring-backend
+      context: ./spring-backend
       dockerfile: Dockerfile
     container_name: neuro-spring
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
   # ================================================================
   m1-tumor-cls:
     build:
-      context: ../m1-tumor-cls
+      context: ./neuro-models/m1-tumor-cls
       dockerfile: Dockerfile
     container_name: model-m1
     restart: unless-stopped
@@ -56,6 +56,8 @@ services:
       - neuro_internal
     environment:
       TZ: Asia/Shanghai
+    volumes:
+      - /data/wsi:/data/wsi:ro
     deploy:
       resources:
         reservations:
@@ -69,7 +71,7 @@ services:
   # ================================================================
   m2-ccrcc:
     build:
-      context: ../m2-ccrcc
+      context: ./neuro-models/m2-ccrcc
       dockerfile: Dockerfile
     container_name: model-m2-ccrcc
     restart: unless-stopped
@@ -90,7 +92,7 @@ services:
   # ================================================================
   m2-prcc:
     build:
-      context: ../m2-prcc
+      context: ./neuro-models/m2-prcc
       dockerfile: Dockerfile
     container_name: model-m2-prcc
     restart: unless-stopped
@@ -111,7 +113,7 @@ services:
   # ================================================================
   m3-nuclei:
     build:
-      context: ../m3-nuclei
+      context: ./neuro-models/m3-nuclei
       dockerfile: Dockerfile
       args:
         TURING_SEGMENT_PKG: ${TURING_SEGMENT_PKG:-turing_segment}
@@ -130,6 +132,8 @@ services:
       M3_MODEL_TYPE: ${M3_MODEL_TYPE:-he2}
       M3_CHANNELS: ${M3_CHANNELS:-0,1,2}
       M3_IMAGE_TYPE: ${M3_IMAGE_TYPE:-cv2}
+    volumes:
+      - /data/tiles:/data/tiles:ro
     deploy:
       resources:
         reservations:
@@ -143,7 +147,7 @@ services:
   # ================================================================
   m4-vstain:
     build:
-      context: ../m4-vstain
+      context: ./neuro-models/m4-vstain
       dockerfile: Dockerfile
     container_name: model-m4
     restart: unless-stopped
@@ -153,6 +157,8 @@ services:
       TZ: Asia/Shanghai
       M4_CHECKPOINT_DIR: /app/checkpoints
       M4_MAX_BATCH_SIZE: ${M4_MAX_BATCH_SIZE:-64}
+    volumes:
+      - /data/artifacts:/data/artifacts
     deploy:
       resources:
         reservations:
@@ -176,7 +182,6 @@ services:
       TZ: Asia/Shanghai
       MODEL_PATH: /data/models
       BASE_TILE_PATH: /data/tiles
-      CUDA_VISIBLE_DEVICES: "1"
     volumes:
       - /data/models:/data/models:ro
       - /data/tiles:/data/tiles:ro
@@ -185,7 +190,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
 
   # ================================================================
@@ -228,7 +233,7 @@ services:
   # ================================================================
   embedding:
     build:
-      context: ../embedding
+      context: ./neuro-models/embedding
       dockerfile: Dockerfile
     container_name: embedding
     restart: unless-stopped

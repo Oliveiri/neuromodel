@@ -2,7 +2,8 @@ FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl tini && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl tini openslide-tools && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,6 +13,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
 
 COPY best_model.pth class_to_idx.json service.py ./
+COPY CLAM/ ./CLAM/
 
 EXPOSE 5001
 

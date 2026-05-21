@@ -1,129 +1,172 @@
-﻿from __future__ import annotations
+"""
+M3 Nuclei Segmentation Service — HoVer-Net backend.
 
-import asyncio
-import json
+POST /predict_batch   — batch inference, returns nuclei polygons + Q1/Q2/Q3
+GET  /readyz          — readiness probe
+GET  /healthz         — liveness probe
+
+Interface compatible with the turing_segment-based model-m3 container.
+Spring requires zero changes.
+"""
+
+from __future__ import annotations
+
 import os
 import shutil
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from PIL import Image
 
-from schemas import BatchManifest, SampleMeta
-from core_infer import run_turing_segment, run_turing_segment_batch, read_polygons, save_upload_file
-from core_geometry import geometries_to_nuclei
-from core_stats import compute_q_stats
+from core_infer import compute_q_stats, extract_polygons, infer_batch, load_model, read_inst_map
 
-app = FastAPI(title="M3 Nucleus Segmentation Service", version="1.0.0")
+app = FastAPI(title="M3 HoVer-Net Service")
 
+# ── config from env ────────────────────────────────────────────────────
+MODEL_PATH = os.getenv("M3_MODEL_PATH", None)
+GPU_ID = os.getenv("M3_GPU", "0")
+SEGMENT_TIMEOUT_SEC = int(os.getenv("M3_SEGMENT_TIMEOUT_SEC", "300"))
 MAX_BATCH_SIZE = int(os.getenv("M3_MAX_BATCH_SIZE", "64"))
-MAX_INFLIGHT_PER_REQUEST = int(os.getenv("M3_MAX_INFLIGHT_PER_REQUEST", "8"))
-GLOBAL_MAX_INFLIGHT = int(os.getenv("M3_GLOBAL_MAX_INFLIGHT", "32"))
-SEGMENT_TIMEOUT_SEC = int(os.getenv("M3_SEGMENT_TIMEOUT_SEC", "120"))
 
-_global_sem = asyncio.Semaphore(GLOBAL_MAX_INFLIGHT)
-_pool = ThreadPoolExecutor(max_workers=max(1, MAX_INFLIGHT_PER_REQUEST * 2))
+
+@app.on_event("startup")
+def startup():
+    t0 = time.time()
+    load_model(model_path=MODEL_PATH, gpu=GPU_ID)
+    print(f"[startup] HoVer-Net loaded in {time.time() - t0:.1f}s", flush=True)
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+def healthz():
     return {"status": "ok"}
 
 
 @app.get("/readyz")
-def readyz() -> dict[str, str]:
+def readyz():
     return {"status": "ready"}
 
 
 @app.post("/predict_batch")
-async def predict_batch(request: Request, manifest: str = Form(...)) -> dict[str, Any]:
-    try:
-        manifest_obj = BatchManifest.model_validate_json(manifest)
-    except Exception as ex:
-        raise HTTPException(status_code=400, detail=f"invalid manifest: {ex}")
-
-    if not manifest_obj.samples:
-        raise HTTPException(status_code=400, detail="samples is empty")
-    if len(manifest_obj.samples) > MAX_BATCH_SIZE:
-        raise HTTPException(status_code=400, detail=f"batch size exceeds limit {MAX_BATCH_SIZE}")
-
+async def predict_batch(request: Request):
+    """
+    Expects multipart/form-data with:
+      manifest : JSON string (text/plain)
+                 { requestId, modelType, samples: [{tileId, imageRef, mpp, level, x, y, width, height}] }
+      img_N    : PNG file for each sample referenced by imageRef
+    """
     form = await request.form()
-    file_map = {k: v for k, v in form.items() if hasattr(v, "filename")}
 
-    # 严格校验每个 sample 的 imageRef 对应存在上传文件
-    for s in manifest_obj.samples:
-        if s.imageRef not in file_map:
-            raise HTTPException(status_code=400, detail=f"missing file for imageRef={s.imageRef}")
-        if s.mpp <= 0:
-            raise HTTPException(status_code=400, detail=f"invalid mpp for tileId={s.tileId}")
+    # ── parse manifest ─────────────────────────────────────────────
+    manifest_raw = form.get("manifest")
+    if manifest_raw is None:
+        raise HTTPException(400, "missing manifest field")
+    import json
+    try:
+        manifest = json.loads(await manifest_raw.read() if hasattr(manifest_raw, "read") else str(manifest_raw))
+    except Exception:
+        raise HTTPException(400, "invalid manifest JSON")
 
-    request_id = manifest_obj.requestId or f"req-{int(time.time() * 1000)}"
+    samples = manifest.get("samples", [])
+    if not samples:
+        raise HTTPException(400, "samples is empty")
+    if len(samples) > MAX_BATCH_SIZE:
+        raise HTTPException(400, f"batch size exceeds limit {MAX_BATCH_SIZE}")
 
-    # 批量推理优化：所有图片写入共享临时目录，一次 turing_segment --image-dir 处理全批
-    # 模型仅加载一次（~30s），避免逐张子进程每张 35s 的开销
-    batch_dir = Path(tempfile.mkdtemp(prefix=f"m3_batch_{request_id}_"))
-    output_dir = Path(tempfile.mkdtemp(prefix=f"m3_out_{request_id}_"))
-    saved: dict[str, Path] = {}  # tileId → 图片路径
+    request_id = manifest.get("requestId", f"req-{int(time.time() * 1000)}")
+
+    # ── write images to shared batch dir ───────────────────────────
+    batch_dir = Path(tempfile.mkdtemp(prefix=f"m3hn_{request_id}_"))
+    output_dir = Path(tempfile.mkdtemp(prefix=f"m3hn_out_{request_id}_"))
+    tile_meta: dict[str, dict] = {}   # tileId → {imageRef, mpp, level, x, y, w, h}
 
     try:
-        for s in manifest_obj.samples:
-            content = await file_map[s.imageRef].read()
-            suffix = Path(file_map[s.imageRef].filename or "input.png").suffix or ".png"
-            img_path = batch_dir / (s.tileId + suffix)
+        for s in samples:
+            tile_id = s.get("tileId")
+            img_ref = s.get("imageRef")
+            if tile_id is None or img_ref is None:
+                raise HTTPException(400, "sample missing tileId or imageRef")
+            upload = form.get(img_ref)
+            if upload is None or not hasattr(upload, "filename"):
+                raise HTTPException(400, f"missing file for imageRef={img_ref}")
+            content = await upload.read()
+            img_path = batch_dir / (tile_id + ".png")
             img_path.write_bytes(content)
-            saved[s.tileId] = img_path
 
-        # 一次 CLI 调用处理全批量文件夹
-        parquet_map = await asyncio.get_running_loop().run_in_executor(
-            _pool,
-            lambda: run_turing_segment_batch(batch_dir, output_dir,
-                                             timeout_sec=SEGMENT_TIMEOUT_SEC),
-        )
-
-        # 逐样本组装结果
-        results: list[dict[str, Any]] = []
-        for s in manifest_obj.samples:
-            t0 = time.perf_counter()
-            base_payload = {
-                "tileId": s.tileId, "imageRef": s.imageRef,
-                "mpp": s.mpp, "level": s.level,
-                "x": s.x, "y": s.y, "width": s.width, "height": s.height,
+            # record metadata
+            with Image.open(img_path) as im:
+                w, h = im.size
+            tile_meta[tile_id] = {
+                "imageRef": img_ref,
+                "mpp": float(s.get("mpp", 0.25)),
+                "level": int(s.get("level", 0)),
+                "x": int(s.get("x", 0)),
+                "y": int(s.get("y", 0)),
+                "width": w,
+                "height": h,
             }
+
+        # ── run HoVer-Net batch inference ──────────────────────────
+        img_paths = list(batch_dir.glob("*.png"))
+        if not img_paths:
+            raise HTTPException(400, "no valid images in batch")
+
+        t0 = time.time()
+        infer_batch(img_paths, output_dir)
+        infer_time = time.time() - t0
+
+        # ── assemble per-sample results ────────────────────────────
+        mat_dir = output_dir / "mat"
+        results: list[dict[str, Any]] = []
+        for s in samples:
+            tile_id = s.get("tileId")
+            meta = tile_meta.get(tile_id, {})
+            base = {
+                "tileId": tile_id,
+                "imageRef": meta.get("imageRef", ""),
+                "mpp": meta.get("mpp", 0.25),
+                "level": meta.get("level", 0),
+                "x": meta.get("x", 0),
+                "y": meta.get("y", 0),
+                "width": meta.get("width", 0),
+                "height": meta.get("height", 0),
+            }
+            t1 = time.time()
+            mat_path = mat_dir / f"{tile_id}.mat"
             try:
-                img_path = saved[s.tileId]
-                pq = parquet_map.get(s.tileId)
-                if pq is None:
-                    raise FileNotFoundError(f"no parquet output for tileId={s.tileId}")
+                if not mat_path.exists():
+                    raise FileNotFoundError(f"mat file not found: {mat_path}")
 
-                geoms = await asyncio.get_running_loop().run_in_executor(
-                    _pool, lambda: read_polygons(pq))
-                nuclei = geometries_to_nuclei(geoms)
+                inst_map = read_inst_map(mat_path)
+                polygons = extract_polygons(inst_map)
+                q1, q2, q3 = compute_q_stats(
+                    polygons, meta.get("width", 256), meta.get("height", 256), meta.get("mpp", 0.25)
+                )
 
-                with Image.open(img_path) as im:
-                    w, h = im.size
-                stats_q1, stats_q2, stats_q3 = compute_q_stats(nuclei, w, h, s.mpp)
-                for n in nuclei:
-                    n.pop("_geom", None)
+                # strip points to save bandwidth
+                for p in polygons:
+                    p.pop("_geom", None)
 
                 results.append({
-                    **base_payload,
-                    "nucleiPolygons": nuclei,
-                    "statsQ1": stats_q1, "statsQ2": stats_q2, "statsQ3": stats_q3,
+                    **base,
+                    "nucleiPolygons": polygons,
+                    "statsQ1": q1,
+                    "statsQ2": q2,
+                    "statsQ3": q3,
                     "meta": {
-                        "nucleusCount": len(nuclei),
-                        "imageWidth": w, "imageHeight": h,
-                        "latencyMs": round((time.perf_counter() - t0) * 1000, 2),
+                        "nucleusCount": len(polygons),
+                        "imageWidth": meta.get("width", 0),
+                        "imageHeight": meta.get("height", 0),
+                        "latencyMs": round((time.time() - t1) * 1000, 2),
                     },
                 })
             except Exception as ex:
                 results.append({
-                    **base_payload,
+                    **base,
                     "error": str(ex),
-                    "meta": {"latencyMs": round((time.perf_counter() - t0) * 1000, 2)},
+                    "meta": {"latencyMs": round((time.time() - t1) * 1000, 2)},
                 })
 
         success_count = sum(1 for r in results if "error" not in r)
@@ -131,81 +174,10 @@ async def predict_batch(request: Request, manifest: str = Form(...)) -> dict[str
             "requestId": request_id,
             "successCount": success_count,
             "failedCount": len(results) - success_count,
+            "inferTimeS": round(infer_time, 2),
             "results": results,
         }
+
     finally:
         shutil.rmtree(batch_dir, ignore_errors=True)
         shutil.rmtree(output_dir, ignore_errors=True)
-
-
-async def _process_one_sample(request_id: str, sample: SampleMeta, upload_file) -> dict[str, Any]:
-    t0 = time.perf_counter()
-
-    base_payload = {
-        "tileId": sample.tileId,
-        "imageRef": sample.imageRef,
-        "mpp": sample.mpp,
-        "level": sample.level,
-        "x": sample.x,
-        "y": sample.y,
-        "width": sample.width,
-        "height": sample.height,
-    }
-
-    work_dir = Path(tempfile.mkdtemp(prefix=f"m3_{request_id}_{sample.tileId}_"))
-    img_path = None
-    try:
-        content = await upload_file.read()
-        suffix = Path(upload_file.filename or "input.png").suffix or ".png"
-        img_path = save_upload_file(content, suffix=suffix)
-
-        seg_out = work_dir / "segment_out"
-
-        # CPU 密集/外部进程调用放线程池中执行
-        parquet_path = await asyncio.get_running_loop().run_in_executor(
-            _pool,
-            lambda: run_turing_segment(img_path, seg_out, timeout_sec=SEGMENT_TIMEOUT_SEC),
-        )
-        geoms = await asyncio.get_running_loop().run_in_executor(_pool, lambda: read_polygons(parquet_path))
-
-        nuclei = geometries_to_nuclei(geoms)
-
-        with Image.open(img_path) as im:
-            w, h = im.size
-
-        stats_q1, stats_q2, stats_q3 = compute_q_stats(nuclei, w, h, sample.mpp)
-
-        # 清理内部几何对象，不对外暴露
-        for n in nuclei:
-            n.pop("_geom", None)
-
-        payload = {
-            **base_payload,
-            "nucleiPolygons": nuclei,
-            "statsQ1": stats_q1,
-            "statsQ2": stats_q2,
-            "statsQ3": stats_q3,
-            "meta": {
-                "nucleusCount": len(nuclei),
-                "imageWidth": w,
-                "imageHeight": h,
-                "latencyMs": round((time.perf_counter() - t0) * 1000, 2),
-            },
-        }
-        return payload
-
-    except Exception as ex:
-        return {
-            **base_payload,
-            "error": str(ex),
-            "meta": {
-                "latencyMs": round((time.perf_counter() - t0) * 1000, 2),
-            },
-        }
-    finally:
-        try:
-            if img_path and Path(img_path).exists():
-                Path(img_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        shutil.rmtree(work_dir, ignore_errors=True)

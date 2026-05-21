@@ -52,11 +52,9 @@ class ResNet18Service:
         输入：PIL.Image（RGB格式）
         输出：严格按照文档定义的结构化 JSON
         """
-        # ---- 输入预处理 ----
         img = image.convert("RGB")
         x = transform(img).unsqueeze(0).to(self.device)
 
-        # ---- 推理 ----
         with torch.no_grad():
             logits = self.model(x)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
@@ -64,7 +62,6 @@ class ResNet18Service:
         pred_index = int(np.argmax(probs))
         confidence = float(probs[pred_index])
 
-        # ---- 构建标准输出 ----
         return {
             "pred_index": pred_index,
             "pred_class": CLASS_NAMES[pred_index],
@@ -73,3 +70,82 @@ class ResNet18Service:
                 CLASS_NAMES[i]: float(probs[i]) for i in range(4)
             },
         }
+
+    @bentoml.api
+    def tissue_coords(self, request: dict) -> dict:
+        """
+        CLAM 组织分割：对 WSI 做组织区域检测，返回组织轮廓和有效 tile 坐标。
+        Java 侧 WsiTileScanService 调用此接口替代全图均匀网格 + isBlankTile。
+        输入：{"wsiPath":"...", "targetLevel":2, "patchSize":256, "stepSize":256,
+               "segLevel":0, "sthresh":8, "mthresh":7, "close":4, "useOtsu":false,
+               "aT":100, "aH":16, "maxNHoles":8}
+        输出：{"contours":[[[x,y],...]], "validCoords":[[x,y],...], "totalTiles":N}
+        """
+        import sys, os
+
+        # CLAM 内部使用 from wsi_core.xxx / from utils.xxx 的相对导入
+        _app_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_app_dir, "CLAM"))
+        sys.path.insert(0, _app_dir)
+
+        from CLAM.wsi_core.WholeSlideImage import WholeSlideImage
+
+        wsi_path = request["wsiPath"]
+        target_level = request.get("targetLevel", 2)
+        patch_size = request.get("patchSize", 256)
+        step_size = request.get("stepSize", 256)
+        seg_level = request.get("segLevel", 0)
+        sthresh = request.get("sthresh", 8)
+        mthresh = request.get("mthresh", 7)
+        close = request.get("close", 4)
+        use_otsu = request.get("useOtsu", False)
+        a_t = request.get("aT", 100)
+        a_h = request.get("aH", 16)
+        max_n_holes = request.get("maxNHoles", 8)
+
+        wsi = WholeSlideImage(wsi_path)
+        wsi.segmentTissue(
+            seg_level=seg_level,
+            sthresh=sthresh,
+            mthresh=mthresh,
+            close=close,
+            use_otsu=use_otsu,
+            filter_params={"a_t": a_t, "a_h": a_h, "max_n_holes": max_n_holes},
+        )
+
+        # 组织轮廓（多边形顶点数组，供前端渲染边界）
+        contours = []
+        for c in wsi.contours_tissue:
+            contours.append(c.reshape(-1, 2).tolist())
+
+        # 有效 tile 坐标（Java 侧直接使用）
+        all_coords = []
+        for cont_idx, contour in enumerate(wsi.contours_tissue):
+            holes = wsi.holes_tissue[cont_idx] if cont_idx < len(wsi.holes_tissue) else []
+            asset_dict, _ = wsi.process_contour(
+                contour, holes,
+                patch_level=target_level,
+                save_path="",
+                patch_size=patch_size,
+                step_size=step_size,
+                contour_fn="four_pt",
+                use_padding=True,
+            )
+            if len(asset_dict) > 0 and len(asset_dict["coords"]) > 0:
+                all_coords.append(asset_dict["coords"])
+
+        coords_list = []
+        if all_coords:
+            coords_list = np.concatenate(all_coords).tolist()
+
+        return {
+            "contours": contours,
+            "validCoords": coords_list,
+            "totalTiles": len(coords_list),
+            "segLevel": seg_level,
+            "targetLevel": target_level,
+        }
+
+    @bentoml.api
+    def healthz(self) -> dict:
+        return {"status": "ok"}

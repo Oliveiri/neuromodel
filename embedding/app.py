@@ -7,10 +7,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
+MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "/app/bge-model")
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+model = SentenceTransformer(MODEL_PATH, device=DEVICE)
 
 app = FastAPI(title="Embedding Service")
 

@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS wsi_slide (
     tile_size INT DEFAULT 256,
     preprocess_status INT DEFAULT 0 COMMENT '0=未处理 1=处理中 2=已完成 3=失败',
     scan_status INT DEFAULT 0 COMMENT '0=未扫描 1=扫描中 2=已完成 3=失败',
+    level_sizes JSON DEFAULT NULL COMMENT '每层真实尺寸 [{level,w,h}]',
+    scan_level INT DEFAULT 2 COMMENT 'M1四分类扫描层级（自动选最接近10×的层）',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS user_conversation (
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     task_id BIGINT DEFAULT NULL,
+    current_wsi_id BIGINT DEFAULT NULL COMMENT '当前正在查看的WSI',
     INDEX idx_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -68,6 +71,7 @@ CREATE TABLE IF NOT EXISTS conversation_message (
     message_order INT NOT NULL,
     is_deleted INT DEFAULT 0,
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    message_type VARCHAR(32) DEFAULT 'text' COMMENT 'text / report',
     structured_data JSON DEFAULT NULL COMMENT '{toolName: {vizData, summaryForAgent}}',
     INDEX idx_conv_order (conversation_id, is_deleted, message_order)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -108,7 +112,24 @@ CREATE TABLE IF NOT EXISTS analysis_task (
     INDEX idx_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 7. 全片肿瘤分类缓存表
+-- 7. 病理诊断报告表
+CREATE TABLE IF NOT EXISTS report (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    wsi_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    conversation_id BIGINT DEFAULT NULL COMMENT '来源对话（可选）',
+    title VARCHAR(256) DEFAULT '病理AI辅助诊断报告',
+    status VARCHAR(32) DEFAULT 'GENERATING' COMMENT 'GENERATING / DRAFT / FINAL / FAILED',
+    content JSON DEFAULT NULL COMMENT '结构化报告正文',
+    error_message TEXT DEFAULT NULL,
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_wsi (wsi_id),
+    INDEX idx_user (user_id),
+    INDEX idx_conv (conversation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 8. 全片肿瘤分类缓存表
 CREATE TABLE IF NOT EXISTS wsi_tile_classification (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     wsi_id BIGINT NOT NULL,
@@ -126,4 +147,24 @@ CREATE TABLE IF NOT EXISTS wsi_tile_classification (
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_wsi_level (wsi_id, level),
     INDEX idx_wsi_tumor (wsi_id, is_tumor)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 9. WSI 高级别区域预计算分析表（M1 完成后手动触发）
+CREATE TABLE IF NOT EXISTS wsi_region_analysis (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    wsi_id BIGINT NOT NULL,
+    level0_x INT NOT NULL,
+    level0_y INT NOT NULL,
+    level0_width INT NOT NULL,
+    level0_height INT NOT NULL,
+    ccrcc_json JSON COMMENT 'M2 ccRCC 完整RLE+统计',
+    prcc_json JSON COMMENT 'M2 pRCC 完整RLE+统计',
+    nuclei_json JSON COMMENT 'M3 核形态完整结果',
+    cd3_image_url VARCHAR(512) COMMENT 'M4 CD3 染色图URL',
+    cd3_viz_json JSON COMMENT 'M4 CD3 vizData',
+    pax5_image_url VARCHAR(512) COMMENT 'M4 PAX5 染色图URL',
+    pax5_viz_json JSON COMMENT 'M4 PAX5 vizData',
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_wsi (wsi_id),
+    INDEX idx_xy (wsi_id, level0_x, level0_y)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
